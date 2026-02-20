@@ -4,6 +4,12 @@ import logging
 import os
 from typing import Tuple, Optional, Callable
 from app.core.config import settings
+from app.agents.sandbox import sandbox_manager
+import json
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None
 
 logger = logging.getLogger(__name__)
 
@@ -14,13 +20,27 @@ class CodexConnector:
     """
     def __init__(self, cli_path: str = settings.CODEX_CLI_PATH, timeout: int = 300):
         import os
+        import shutil
         if not os.path.isabs(cli_path):
-             self.cli_path = os.path.abspath(cli_path)
+             resolved = shutil.which(cli_path)
+             if resolved:
+                 self.cli_path = resolved
+             else:
+                 self.cli_path = os.path.abspath(cli_path)
         else:
              self.cli_path = cli_path
         self.timeout = timeout
 
-    def run_prompt(self, prompt: str, model: str = settings.CODEX_MODEL, log_callback: Optional[Callable[[str], None]] = None) -> Tuple[str, str, int]:
+    def run_prompt(
+        self, 
+        prompt: str, 
+        model: str = settings.CODEX_MODEL, 
+        log_callback: Optional[Callable[[str], None]] = None,
+        sandbox: str = "read-only",
+        approval: str = "never",
+        cwd: Optional[str] = None,
+        expected_schema: Optional[dict] = None
+    ) -> Tuple[str, str, int]:
         """
         Runs a prompt against the Codex CLI.
         Falls back to direct Azure OpenAI API call if CLI is missing.
@@ -35,21 +55,49 @@ class CodexConnector:
         # Pass prompt via stdin for robustness
         # Skip git checks since we are running via wrapper
         # Explicitly configure Azure provider
-        cmd = [
-            self.cli_path, "exec", 
-            "--skip-git-repo-check", 
-            "--model", model, 
-            "-c", "model_provider=azure",
-            "-c", "model_providers.azure.name=\"Azure OpenAI\"",
-            "-c", f"model_providers.azure.base_url=\"{settings.AZURE_OPENAI_ENDPOINT}\"",
-            "-c", "model_providers.azure.env_key=AZURE_OPENAI_API_KEY",
-            "-c", "model_providers.azure.wire_api=\"responses\"",
-            "--sandbox", "read-only",
-            "-"
-        ]
-        # configured to read this specific environment variable name.
+        provider = getattr(settings, "LLM_PROVIDER", "azure").lower()
         env = os.environ.copy()
-        env["AZURE_OPENAI_API_KEY"] = settings.AZURE_OPENAI_API_KEY
+
+        if provider == "openai":
+            cmd = [
+                self.cli_path,
+                "-a", approval,
+                "exec", 
+                "--skip-git-repo-check", 
+                "--model", model, 
+                "-c", "model_provider=openai",
+                "-c", "model_providers.openai.name=\"OpenAI\"",
+                "-c", "model_providers.openai.env_key=OPENAI_API_KEY",
+                "--sandbox", sandbox,
+                "-"
+            ]
+            env["OPENAI_API_KEY"] = getattr(settings, "OPENAI_API_KEY", "")
+            # Scrub Together AI and Qwen leftovers to ensure GPT-5.2/OpenAI native is used
+            # Explicitly remove variables that might trigger Together AI routing or Qwen defaults
+            if "TOGETHER_API_KEY" in env:
+                del env["TOGETHER_API_KEY"]
+            if "CODEX_MODEL" in env:
+                del env["CODEX_MODEL"]
+
+            # Force remove custom proxy URLs since Codex CLI strictly requires /v1/responses
+            if "OPENAI_BASE_URL" in env:
+                del env["OPENAI_BASE_URL"]
+        else:
+            cmd = [
+                self.cli_path, 
+                "-a", approval,
+                "exec", 
+                "--skip-git-repo-check", 
+                "--model", model, 
+                "-c", "model_provider=azure",
+                "-c", "model_providers.azure.name=\"Azure OpenAI\"",
+                "-c", f"model_providers.azure.base_url=\"{settings.AZURE_OPENAI_ENDPOINT}\"",
+                "-c", "model_providers.azure.env_key=AZURE_OPENAI_API_KEY",
+                "-c", "model_providers.azure.wire_api=\"responses\"",
+                "--sandbox", sandbox,
+                "-"
+            ]
+            env["AZURE_OPENAI_API_KEY"] = getattr(settings, "AZURE_OPENAI_API_KEY", "")
         # Force unbuffered output for Python subprocesses (if codex is python)
         env["PYTHONUNBUFFERED"] = "1"
 
@@ -59,47 +107,43 @@ class CodexConnector:
         try:
             logger.info(f"Running Codex command: {' '.join(cmd)} ...") 
             
-            # Using Popen for streaming output
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, # Merge stderr for simpler unified streaming
-                text=True,
-                encoding='utf-8', # Fix: Force UTF-8 encoding for Windows
-                env=env,
-                bufsize=1  # Line buffered
+            # Priority 1: Deterministic Handshake Prompting
+            # We prefix the prompt to guide the agent toward the framing protocol
+            handshake_prefix = (
+                "CRITICAL: YOUR OUTPUT MUST START WITH A JSONL LINE PREFIXED BY 'AGENT_JSON_START:'.\n"
+                "EXAMPLE: AGENT_JSON_START: {\"status\": \"success\", \"intent\": \"apply_patch\"}\n\n"
             )
-            
-            # Write prompt to stdin
-            if process.stdin:
-                try:
-                    # Ensure prompt ends with newline just in case the CLI tool expects it
-                    if not prompt.endswith("\n"):
-                        prompt += "\n"
-                    process.stdin.write(prompt)
-                    process.stdin.flush() # Explicit flush
-                    process.stdin.close()
-                except (BrokenPipeError, OSError):
-                    pass # Process might have exited early
+            prompt = handshake_prefix + prompt
 
-            # Read output line by line
-            if process.stdout:
-                # Use a while loop with explicit readline to ensure we don't buffer excessively
-                while True:
-                    line = process.stdout.readline()
-                    if not line and process.poll() is not None:
-                        break
-                    if line:
-                        stdout_lines.append(line)
-                        if log_callback:
-                            # Send immediately without buffering
-                            log_callback(line.rstrip())
-                            # Force a small sleep to yield if loop is too tight? No, this is blocking IO.
-            
-            process.wait(timeout=self.timeout)
-            
-            full_output = "".join(stdout_lines)
+            # Use Sandbox Manager instead of raw Popen for execution
+            full_output, stderr, returncode = sandbox_manager.execute(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdin=prompt
+            )
+
+            # Refined JSON Extraction via Framing Protocol
+            if expected_schema and jsonschema:
+                try:
+                    # Look for the framed line
+                    import re
+                    json_frame_match = re.search(r"^AGENT_JSON_START:\s*(\{.*?\})", full_output, re.MULTILINE)
+                    
+                    # Fallback to general regex if framing fails
+                    if not json_frame_match:
+                        json_frame_match = re.search(r"(\{.*?\})", full_output, re.DOTALL)
+
+                    if json_frame_match:
+                        json_str = json_frame_match.group(1)
+                        response_json = json.loads(json_str)
+                        jsonschema.validate(instance=response_json, schema=expected_schema)
+                        logger.info("✅ Framed JSON validated successfully.")
+                    else:
+                        logger.warning("⚠️ No valid AGENT_JSON_START frame found.")
+                except Exception as e:
+                    logger.error(f"❌ Deterministic I/O Validation Failed: {e}")
+                    # We don't necessarily fail the whole process yet, but we could return an error code
             
             # Extract code blocks if present to separate from logs
             # Simple heuristic: if we find a code block, try to extract it?
@@ -119,6 +163,41 @@ class CodexConnector:
         except Exception as e:
             logger.exception("Unexpected error running Codex CLI")
             return "", str(e), 1
+
+    async def run_ensemble(
+        self, 
+        prompt: str, 
+        models: List[str], 
+        **kwargs
+    ) -> Tuple[str, str, int]:
+        """
+        Runs the prompt against multiple models in parallel.
+        Returns the first success based on JSON status.
+        """
+        import asyncio
+        
+        async def _run_one(model_name):
+            # Run in thread pool since run_prompt is likely blocking
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, 
+                lambda: self.run_prompt(prompt, model=model_name, **kwargs)
+            )
+
+        results = await asyncio.gather(*[_run_one(m) for m in models], return_exceptions=True)
+        
+        for res in results:
+            if isinstance(res, Exception): continue
+            stdout, stderr, code = res
+            if code == 0 and '"status": "success"' in stdout:
+                return res
+        
+        # Fallback to first if none "success"
+        for res in results:
+            if not isinstance(res, Exception):
+                return res
+                
+        return "", "All models failed", 1
 
     def _run_api_fallback(self, prompt: str, model: str) -> Tuple[str, str, int]:
         """

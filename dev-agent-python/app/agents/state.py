@@ -26,3 +26,12 @@ class AgentState(TypedDict):
     error: Optional[str]
     attempts: int
     retry_count: int                        # New: Loop counter
+    original_branch: Optional[str]          # New: Track original branch for transactional merge
+    error_class: Optional[str]              # New: Category for targeted repair (SYNTAX, DEP, etc)
+    risk_score: Optional[int]               # New: Priority 2 risk assessment score
+    task_graph: Optional[List[Dict]]        # New: Priority 3 DAG of tasks
+    project_state: Optional[Dict]           # New: Priority 3 persistent memory
+    strategy: Optional[str]                 # New: Priority A selected execution strategy
+    reflection_hypothesis: Optional[str]    # New: Priority C repair logic
+    next_recommended_action: Optional[str]  # New: Priority C repair logic
+    current_task: Optional[Dict]            # New: Priority B current DAG node mapping

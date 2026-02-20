@@ -53,11 +53,24 @@ def run_agent_workflow(self, user_input: str, job_id: str, repo_url: str = None,
             app = workflow.compile(checkpointer=memory)
             return await app.ainvoke(initial_state, config=config)
 
+        import time
+        start_time = time.time()
         final_state = asyncio.run(_run_workflow())
+        latency = time.time() - start_time
         
+        # Phase 4.3: Sustainability Metrics
+        metrics = {
+            "job_id": job_id,
+            "status": final_state.get("status"),
+            "retries": final_state.get("retry_count", 0),
+            "latency_seconds": round(latency, 2),
+            "success": final_state.get("status") == "testing_complete"
+        }
+        logger.info(f"📊 SUSTAINABILITY METRICS: {json.dumps(metrics)}")
+        log_streamer.publish_log(job_id, f"📊 Analytics: Latency {metrics['latency_seconds']}s | Retries {metrics['retries']}", "INFO")
+
         return final_state
 
     except Exception as e:
         logger.error(f"JOB {job_id}: Failed with {e}")
-        # Phase 3.3: Handle failure/rollback here if needed
         return {"status": "failed", "error": str(e)}

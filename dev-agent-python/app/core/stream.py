@@ -13,6 +13,9 @@ class LogStreamer:
         self.redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
     def publish_log(self, job_id: str, message: str, level: str = "INFO"):
+        from app.agents.logic.sanitizer import sanitizer
+        message = sanitizer.sanitize(message)
+        
         # Also log to standard Python logger for persistence
         if level == "ERROR":
             logger.error(f"[JOB {job_id}] {message}")

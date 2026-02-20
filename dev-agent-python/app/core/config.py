@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     # Paths
     CODEX_CLI_PATH: str = "codex" 
     
+    # LLM Provider Configuration
+    LLM_PROVIDER: str = "azure" # Options: azure, openai
+    OPENAI_API_KEY: str = ""
+
     # Azure OpenAI
     AZURE_OPENAI_API_KEY: str = ""
     AZURE_OPENAI_ENDPOINT: str = ""
