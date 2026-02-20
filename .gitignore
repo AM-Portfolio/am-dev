@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.pytest_cache/
+build/
+dist/
+*.log
+
+# Generated outputs
+generated_output/
+dev-agent-ui/build/
+dev-agent-ui/.dart_tool/
+dev-agent-ui/.dart/
+.devcontainer/
+.idea/
+.vscode/
+*.iml
+
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub/
+.flutter-plugins
+pubspec.lock
+
+# OS
+.DS_Store
+Thumbs.db
